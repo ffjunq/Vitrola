@@ -1,5 +1,7 @@
 #include <Arduino.h>
 
+#define SETPOINT_RPM(rpm) ((rpm) >= 40 ? 45.0 : 33.3)
+
 // Configurações
 #define SENSOR_PIN 34               // Pino digital onde o TCRT5000 está conectado
 #define DEBOUNCE_TIME 500000        // Tempo de debounce em microssegundos (500ms)
@@ -19,11 +21,6 @@ float Kp = 1.0; // Proporcional
 float Ki = 0.01; // Integral
 float Kd = 0.05;  // Derivativo
 
-// Variáveis para suavização do output
-float smoothedOutput = 0; // Saída suavizada
-float smoothingFactor = 0.005; // Fator de suavização (quanto menor, mais suave)
-
-
 // Função de interrupção
 void IRAM_ATTR countPulse() 
 {
@@ -36,6 +33,99 @@ void IRAM_ATTR countPulse()
     pulseDetected = true;                        // Marca que um novo pulso foi detectado
     lastPulseTime = currentTime;                 // Atualiza o tempo do último pulso
   }
+}
+
+// Função para calcular o RPM
+float calculateRPM() 
+{
+  static float rpm = 0; // Valor atual de RPM
+
+  // Calcula o RPM quando um novo pulso é detectado
+  if (pulseDetected) 
+  {
+    noInterrupts(); // Desativa as interrupções para acessar variáveis voláteis com segurança
+    unsigned long interval = pulseInterval;
+    pulseDetected = false; // Reseta a flag após leitura
+    interrupts(); // Reativa as interrupções
+
+    // Evita divisões por zero
+    if (interval > 0) 
+    {
+      rpm = (1.0 / (interval / 1000000.0)) * 60.0; // Calcula o RPM
+    }
+  }
+
+  // Zera o RPM se o último pulso foi há mais de 3 segundos
+  if ((micros() - lastPulseTime) > RPM_RESET_TIMEOUT) 
+  {
+    rpm = 0;
+  }
+
+  return rpm;
+}
+
+// Função para controlar o PID
+float computePID(float rpm, float setpoint) 
+{
+  static float error = 0;             // Erro atual
+  static float lastError = 0;         // Erro na última iteração
+  static float integral = 0;          // Acumulador do erro
+  static float derivative = 0;        // Taxa de variação do erro
+  static float output = 0;            // Saída do controlador PID
+
+  // Controle PID
+  error = setpoint - rpm;
+  integral += error;
+  derivative = error - lastError;
+  output = (Kp * error) + (Ki * integral) + (Kd * derivative);
+  lastError = error;
+
+  return output;
+}
+
+// Função para imprimir os dados no monitor serial
+void printData(float rpm, float setpoint, float smoothedOutput) 
+{
+  Serial.print("RPM: ");
+  Serial.print(rpm, 2);
+  Serial.print(" | Setpoint: ");
+  Serial.print(setpoint);
+  Serial.print(" | Output: ");
+  Serial.println(smoothedOutput);
+}
+
+// Função para ativar o motor com a saída suavizada
+float activateMotor(float rpm, float pidOutput) 
+{
+  // Variáveis para suavização do output
+  float smoothingFactor = 0.005; // Fator de suavização (quanto menor, mais suave)
+  static float smoothedOutput = 0;
+
+  // Condição para usar smoothedOutput apenas entre RPMs específicos
+  if ((rpm >= 32 && rpm <= 34) || (rpm >= 44 && rpm <= 46)) 
+  {
+    // Suavização da transição do output
+    smoothingFactor = 0.05;
+  } else 
+  {
+    // Se não estiver nos intervalos, usa a saída bruta
+    smoothingFactor = 0.5;
+  }
+
+  smoothedOutput = smoothedOutput + smoothingFactor * (pidOutput - smoothedOutput);
+
+  // Limita a saída entre 150 e 180 (valores válidos para PWM)
+  smoothedOutput = constrain(smoothedOutput, 0, 170);
+
+  // Ajusta a direção e velocidade do motor com a saída suavizada
+  if (smoothedOutput > 0) 
+  {
+    digitalWrite(IN3_PIN, LOW);
+    digitalWrite(IN4_PIN, HIGH);
+    ledcWrite(0, smoothedOutput); // Define a velocidade suavizada
+  }
+  
+  return smoothedOutput;
 }
 
 void setup() 
@@ -54,7 +144,7 @@ void setup()
   // Inicializa motor parado
   digitalWrite(IN3_PIN, LOW);
   digitalWrite(IN4_PIN, LOW);
-  ledcWrite(0, 0);
+  ledcWrite(0, 150);
 
   // Configura a interrupção para disparar na borda de descida (fita branca detectada)
   attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), countPulse, FALLING);
@@ -62,80 +152,27 @@ void setup()
 
 void loop() 
 {
-  static float rpm = 0;               // Valor atual de RPM
   static float setpoint = 0;          // Valor desejado de RPM
-  static float error = 0;             // Erro atual
-  static float lastError = 0;         // Erro na última iteração
-  static float integral = 0;          // Acumulador do erro
-  static float derivative = 0;        // Taxa de variação do erro
-  static float output = 0;            // Saída do controlador PID
-
   static unsigned long lastPrintTime = 0;  // Última vez que os dados foram impressos
   unsigned long currentTime = micros();   // Tempo atual em microssegundos
 
-  // Calcula o RPM quando um novo pulso é detectado
-  if (pulseDetected) 
-  {
-    noInterrupts(); // Desativa as interrupções para acessar variáveis voláteis com segurança
-    unsigned long interval = pulseInterval;
-    pulseDetected = false; // Reseta a flag após leitura
-    interrupts(); // Reativa as interrupções
-
-    // Evita divisões por zero
-    if (interval > 0) 
-    {
-      rpm = (1.0 / (interval / 1000000.0)) * 60.0; // Calcula o RPM
-    }
-  }
-
-  // Zera o RPM se o último pulso foi há mais de 3 segundos
-  if ((currentTime - lastPulseTime) > RPM_RESET_TIMEOUT) 
-  {
-    rpm = 0;
-  }
+  // Calcula o RPM
+  float rpm = calculateRPM();
 
   // Define o setpoint com base no RPM atual
-  setpoint = 33.3;
-  if (rpm >= 40) 
-  {
-    setpoint = 45.0;
-  }
+  setpoint = SETPOINT_RPM(rpm);
 
-  // Controle PID
-  error = setpoint - rpm;
-  integral += error;
-  derivative = error - lastError;
-  output = (Kp * error) + (Ki * integral) + (Kd * derivative);
-  lastError = error;
-
-  // Limita a saída entre 0 e 255 (valores válidos para PWM)
-  output = constrain(output, 150, 180);
-
-  // Condição para usar smoothedOutput apenas entre RPMs específicos
-  if ((rpm >= 32 && rpm <= 34) || (rpm >= 44 && rpm <= 46)) {
-    // Suavização da transição do output
-    smoothedOutput = smoothedOutput + smoothingFactor * (output - smoothedOutput);
-  } else {
-    // Se não estiver nos intervalos, usa a saída bruta
-    smoothedOutput = output;
-  }
+  // Calcula a saída do PID
+  float pidOutput = computePID(rpm, setpoint);
 
   // Ajusta a direção e velocidade do motor com a saída suavizada
-  if (smoothedOutput > 0) {
-    digitalWrite(IN3_PIN, LOW);
-    digitalWrite(IN4_PIN, HIGH);
-    ledcWrite(0, smoothedOutput); // Define a velocidade suavizada
-  }
+  float smoothedPidOutput = activateMotor(rpm, pidOutput);
 
   // Verifica se já passou 100ms para exibir os dados no monitor serial
-  if (currentTime - lastPrintTime >= 100) {
+  if (currentTime - lastPrintTime >= 100) 
+  {
     // Exibe informações no monitor serial
-    Serial.print("RPM: ");
-    Serial.print(rpm, 2);
-    Serial.print(" | Setpoint: ");
-    Serial.print(setpoint);
-    Serial.print(" | Output: ");
-    Serial.println(smoothedOutput);
+    printData(rpm, setpoint, smoothedPidOutput);
 
     // Atualiza o tempo da última impressão
     lastPrintTime = currentTime;
