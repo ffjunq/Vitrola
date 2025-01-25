@@ -65,13 +65,23 @@ float calculateRPM()
 }
 
 // Função para controlar o PID
-float computePID(float rpm, float setpoint) 
+// Função para controlar o PID
+float computePID(float rpm, float setpoint, bool resetPID) 
 {
   static float error = 0;             // Erro atual
   static float lastError = 0;         // Erro na última iteração
   static float integral = 0;          // Acumulador do erro
   static float derivative = 0;        // Taxa de variação do erro
   static float output = 0;            // Saída do controlador PID
+
+  // Se o PID precisar ser resetado (RPM == 0), zerar as variáveis
+  if (resetPID) {
+    error = 0;
+    lastError = 0;
+    integral = 0;
+    derivative = 0;
+    output = 0;
+  }
 
   // Controle PID
   error = setpoint - rpm;
@@ -115,7 +125,7 @@ float activateMotor(float rpm, float pidOutput)
   smoothedOutput = smoothedOutput + smoothingFactor * (pidOutput - smoothedOutput);
 
   // Limita a saída entre 150 e 180 (valores válidos para PWM)
-  smoothedOutput = constrain(smoothedOutput, 0, 170);
+  smoothedOutput = constrain(smoothedOutput, 150, 170);
 
   // Ajusta a direção e velocidade do motor com a saída suavizada
   if (smoothedOutput > 0) 
@@ -141,10 +151,10 @@ void setup()
   ledcAttachPin(ENB_PIN, 0);
   ledcSetup(0, 5000, 8); // Frequência de 5kHz, resolução de 8 bits
 
-  // Inicializa motor parado
+  // Inicializa motor 150 de PWM
   digitalWrite(IN3_PIN, LOW);
-  digitalWrite(IN4_PIN, LOW);
-  ledcWrite(0, 150);
+  digitalWrite(IN4_PIN, HIGH);
+  ledcWrite(0, 150); // Define a velocidade suavizada
 
   // Configura a interrupção para disparar na borda de descida (fita branca detectada)
   attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), countPulse, FALLING);
@@ -155,18 +165,43 @@ void loop()
   static float setpoint = 0;          // Valor desejado de RPM
   static unsigned long lastPrintTime = 0;  // Última vez que os dados foram impressos
   unsigned long currentTime = micros();   // Tempo atual em microssegundos
+  static bool pidActive = false; // Flag para verificar se o PID está ativado
+  static bool resetPID = false; // Flag para controlar o reset do PID
 
   // Calcula o RPM
   float rpm = calculateRPM();
 
+  // Desativa o PID e reseta os parâmetros se o RPM zerar
+  if (rpm == 0) 
+  {
+    pidActive = false; // Desativa o PID quando o RPM for 0
+    resetPID = true;   // Ativa o reset do PID
+  } 
+  else 
+  {
+    resetPID = false;  // Desativa o reset do PID quando o RPM for diferente de 0
+  }
+
+  // Ativa o PID apenas quando o RPM estiver em torno de 30 RPM
+  if (rpm >= 30 && !pidActive) 
+  {
+    pidActive = true; // Ativa o PID quando o RPM atingir o valor mínimo
+  }
+
+
   // Define o setpoint com base no RPM atual
   setpoint = SETPOINT_RPM(rpm);
 
-  // Calcula a saída do PID
-  float pidOutput = computePID(rpm, setpoint);
+  // Se o PID está ativo, calcula a saída do PID
+  float smoothedPidOutput = 0;
+  if (pidActive) 
+  {
+    // Calcula a saída do PID
+    float pidOutput = computePID(rpm, setpoint, resetPID);
 
-  // Ajusta a direção e velocidade do motor com a saída suavizada
-  float smoothedPidOutput = activateMotor(rpm, pidOutput);
+    // Ajusta a direção e velocidade do motor com a saída suavizada
+    smoothedPidOutput = activateMotor(rpm, pidOutput);
+  }
 
   // Verifica se já passou 100ms para exibir os dados no monitor serial
   if (currentTime - lastPrintTime >= 100) 
