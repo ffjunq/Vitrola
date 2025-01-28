@@ -1,14 +1,16 @@
 #include <Arduino.h>
 
-#define SETPOINT_RPM(rpm) ((rpm) >= 40 ? 45.0 : 33.3)
-#define HYSTERESIS 1.0
+#define SETPOINT_RPM(rpm) ((rpm) >= 38 ? 45.0 : 33.3)
+#define HYSTERESIS 2
 #define ERROR_TOLERANCE 0.3
-#define PWM_MOTOR_INICIAL 115
+#define PWM_MOTOR_INICIAL 130//95
 // Configurações
 #define SENSOR_PIN 34
-#define DEBOUNCE_TIME 100000        // 100ms
-#define RPM_RESET_TIMEOUT 3000000
+#define DEBOUNCE_TIME 100000        // 200ms
+#define RPM_RESET_TIMEOUT 3000
 #define PULSES_PER_REVOLUTION 4
+#define MIN_INTERVAL 200000  // 200ms (equivale a 75 RPM)
+#define MAX_INTERVAL 600000  // 600ms (equivale a 25 RPM)
 
 #define IN3_PIN 25
 #define IN4_PIN 26
@@ -18,63 +20,93 @@
 volatile unsigned long lastPulseTime = 0;
 volatile unsigned long pulseInterval = 0;
 volatile bool pulseDetected = false;
+volatile bool newPulse = false; // Declare no início do código (junto com pulseDetected)
 
 // Constantes PID
-float Kp = 4.0;    
-float Ki = 0.05;    
-float Kd = 0.2;    
+float Kp = 1.8;    
+float Ki = 0.25;    
+float Kd = 0.8;    
 
 // Variáveis de tempo
 unsigned long lastPIDTime = 0;
-const unsigned long PIDInterval = 10; // 10ms para loop de controle
 
 void IRAM_ATTR countPulse() {
   unsigned long currentTime = micros();
   if ((currentTime - lastPulseTime) >= DEBOUNCE_TIME) {
     pulseInterval = currentTime - lastPulseTime;
+    // Verifica se o intervalo é plausível
+    if (pulseInterval < MIN_INTERVAL || pulseInterval > MAX_INTERVAL) 
+    {
+        lastPulseTime = currentTime;
+        return; // Mantém o último valor válido
+    }
     pulseDetected = true;
+    newPulse = true;
     lastPulseTime = currentTime;
   }
 }
 
 float calculateRPM() {
-  static float rpm = 0;
-  static float rpmBuffer[5] = {0}; // Buffer para média móvel
-  static int index = 0;
+    static float rpm = 0;
+    static float rpmBuffer[3] = {0}; // Buffer de 10 amostras
+    static int index = 0;
+    static long lastUpdateTime = 0;
 
-  if (pulseDetected) {
-    noInterrupts();
-    unsigned long interval = pulseInterval;
-    pulseDetected = false;
-    interrupts();
-
-    if (interval > 0) {
-      float newRPM = (60000000.0 / (interval * PULSES_PER_REVOLUTION));
-      rpmBuffer[index] = newRPM;
-      index = (index + 1) % 5; // Atualiza buffer
-      float sum = 0;
-      for (int i = 0; i < 5; i++) sum += rpmBuffer[i];
-      rpm = sum / 5; // Média dos últimos 5 valores
+    lastUpdateTime = millis();
+    // Aguarda o primeiro pulso válido
+    while(!pulseDetected)
+    {
+      if(millis() - lastUpdateTime > RPM_RESET_TIMEOUT) // Se passaram 1 segundo sem novo pulso
+      {
+        return 0;
+      }
     }
-  }
 
-  if ((micros() - lastPulseTime) > RPM_RESET_TIMEOUT) {
-    rpm = 0;
-  }
+    // Atualiza RPM usando buffer circular e média móvel
+    if (pulseDetected) 
+    {
+        noInterrupts();
+        unsigned long interval = pulseInterval;
+        pulseDetected = false;
+        interrupts();
 
-  return rpm;
+        if (interval > 100) { // Filtro de intervalos inválidos
+            float newRPM = 60000000.0 / (interval * PULSES_PER_REVOLUTION);
+            rpmBuffer[index] = newRPM; // Atualiza buffer
+            index = (index + 1) % 10;
+
+            // Média móvel
+            float sum = 0;
+            for (int i = 0; i < 3; i++) sum += rpmBuffer[i];
+            float avgRPM = sum / 3;
+
+            // Filtro exponencial para suavização adicional
+            rpm = 0.8 * avgRPM + 0.2 * rpm;
+        }
+    }
+
+    // Reset se não houver pulsos
+    //if ((micros() - lastPulseTime) > RPM_RESET_TIMEOUT) rpm = 0;
+
+    return rpm;
 }
 
 float computePID(float rpm, float setpoint, bool resetPID) {
   static float integral = 0;
-  static float lastRPM = 0;
-  const float dt = max(pulseInterval / 1000000.0, 0.001); // Valor mínimo de 1 ms
+
+  // Usa o intervalo do pulso atual para dt
+  const float dt = fmaxf(pulseInterval / 1000000.0f, 0.001f);
+
+  static float lastError = 0;
   float error = setpoint - rpm;
   
-  if (resetPID || abs(error) > 5.0) { // Reinicia integral apenas em grandes desvios
+  if (resetPID) { // Reinicia integral apenas em grandes desvios
     integral = 0;
-    lastRPM = rpm;
     return PWM_MOTOR_INICIAL;
+  }
+
+  if (abs(error) < ERROR_TOLERANCE) {
+    integral = 0; // Anti-windup em regime permanente
   }
   
   // Termo Proporcional
@@ -82,12 +114,15 @@ float computePID(float rpm, float setpoint, bool resetPID) {
   
   // Termo Integral com clamping dinâmico
   integral += Ki * error * dt;
-  integral = constrain(integral, -5, 5); // Limites mais conservadores
-  
+  integral = constrain(integral, -3, 3); // Limites mais amplos
+
   // Termo Derivativo baseado na variação do RPM
-  float D = -Kd * (rpm - lastRPM) / dt; // Sinal negativo para ação correta
-  float filteredD = 0.8 * filteredD + 0.2 * D; // Filtro exponencial
-  lastRPM = rpm;
+  static float lastRpm = 0;
+  float D = -Kd * (rpm - lastRpm) / dt; // Derivativo baseado na variação do RPM
+  lastRpm = rpm;
+  static float filteredD = 0; // Variável estática para manter o estado
+  filteredD = 0.85 * filteredD + 0.15 * D;  
+  lastError = error;
   
   float output = PWM_MOTOR_INICIAL + P + integral + filteredD;
   output = constrain(output, 0, 255);
@@ -98,6 +133,8 @@ float computePID(float rpm, float setpoint, bool resetPID) {
   Serial.print(integral);
   Serial.print(" D:");
   Serial.print(D);
+  Serial.print(" Error:");
+  Serial.print(error, 4);
   
   return output;
 }
@@ -105,21 +142,23 @@ float computePID(float rpm, float setpoint, bool resetPID) {
 float activateMotor(float pidOutput) 
 {
   static float output = PWM_MOTOR_INICIAL;
-  const float smoothingFactor = 0.01; // Resposta mais rápida
+  const float smoothingFactor = 0.3; // Resposta mais rápida
   
   output += smoothingFactor * (pidOutput - output);
   output = constrain(output, 0, 255);
   
+  // Converter para inteiro com arredondamento correto
+  output = lround(output); // Usa arredondamento matemático
+
   digitalWrite(IN3_PIN, LOW);
   digitalWrite(IN4_PIN, HIGH);
-  ledcWrite(0, (int)output);
+  ledcWrite(0, output);
 
   return output;
 }
 
 void printDebug(float rpm, float setpoint, float output) {
   static unsigned long lastPrint = 0;
-//  if(millis() - lastPrint > 100) {
     Serial.print(" TEMP:");
     Serial.print(millis());
     Serial.print(" RPM:");
@@ -129,7 +168,6 @@ void printDebug(float rpm, float setpoint, float output) {
     Serial.print(" OUT:");
     Serial.println(output);
     lastPrint = millis();
-//   }
 }
 
 void setup() {
@@ -145,6 +183,7 @@ void setup() {
   
   digitalWrite(IN3_PIN, LOW);
   digitalWrite(IN4_PIN, HIGH);
+  ledcWrite(0, PWM_MOTOR_INICIAL);
 
   attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), countPulse, FALLING);
 }
@@ -179,16 +218,18 @@ void loop()
   
   if(pidActive) 
   {
-    static float lastRpm = 0;
     static float smoothingOut = 0;
-    float rpmError = abs(rpm - setpoint);
     //if(rpmError >= ERROR_TOLERANCE) 
-    if(lastRpm != rpm)
+    if(newPulse)
     {
       float output = computePID(rpm, setpoint, !pidActive);
       smoothingOut = activateMotor(output);
       printDebug(rpm, setpoint, smoothingOut);
-      lastRpm = rpm;
+      newPulse = false;
     }
+  }
+  else
+  {
+    Serial.print("PID OFF!");
   }
 }
