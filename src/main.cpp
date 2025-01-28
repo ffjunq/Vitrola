@@ -246,7 +246,7 @@ void loop()
       ledcWrite(0, PWM_MOTOR_INICIAL_33);
     }
   } 
-  else if(rpm > 25 && !pidActive && setpoint == 45.0) 
+  else if(rpm > 30 && !pidActive) 
   {
     pidActive = true;
   }
