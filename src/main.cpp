@@ -1,9 +1,10 @@
 #include <Arduino.h>
 
 #define SETPOINT_RPM(rpm) ((rpm) >= 38 ? 45.0 : 33.3)
-#define HYSTERESIS 2
+#define HYSTERESIS 0
 #define ERROR_TOLERANCE 0.3
-#define PWM_MOTOR_INICIAL 130//95
+#define PWM_MOTOR_INICIAL_33 130//95
+#define PWM_MOTOR_INICIAL_45 155//95
 // Configurações
 #define SENSOR_PIN 34
 #define DEBOUNCE_TIME 100000        // 200ms
@@ -16,16 +17,24 @@
 #define IN4_PIN 26
 #define ENB_PIN 27
 
+// Constantes PID para 33 RPM (mantenha os valores originais)
+#define KP_33 1.8
+#define KI_33 0.25
+#define KD_33 0.8
+
+// Constantes PID para 45 RPM (valores ajustados)
+#define KP_45 3.2   // Maior resposta proporcional
+#define KI_45 0.18  // Integral menor para evitar windup
+#define KD_45 1.5   // Derivativo mais forte para amortecer oscilações
+
+// Constantes PID
+float Kp, Ki, Kd;
+
 // Variáveis voláteis
 volatile unsigned long lastPulseTime = 0;
 volatile unsigned long pulseInterval = 0;
 volatile bool pulseDetected = false;
-volatile bool newPulse = false; // Declare no início do código (junto com pulseDetected)
-
-// Constantes PID
-float Kp = 1.8;    
-float Ki = 0.25;    
-float Kd = 0.8;    
+volatile bool newPulse = false; // Declare no início do código (junto com pulseDetected) 
 
 // Variáveis de tempo
 unsigned long lastPIDTime = 0;
@@ -102,7 +111,7 @@ float computePID(float rpm, float setpoint, bool resetPID) {
   
   if (resetPID) { // Reinicia integral apenas em grandes desvios
     integral = 0;
-    return PWM_MOTOR_INICIAL;
+    return PWM_MOTOR_INICIAL_33;
   }
 
   if (abs(error) < ERROR_TOLERANCE) {
@@ -114,17 +123,32 @@ float computePID(float rpm, float setpoint, bool resetPID) {
   
   // Termo Integral com clamping dinâmico
   integral += Ki * error * dt;
-  integral = constrain(integral, -3, 3); // Limites mais amplos
+  if (SETPOINT_RPM(rpm) == 45.0) {
+    integral = constrain(integral, -1.5, 1.5);
+  } else {
+    integral = constrain(integral, -3, 3);
+  }
 
   // Termo Derivativo baseado na variação do RPM
   static float lastRpm = 0;
+  static float lastFilteredD = 0;
   float D = -Kd * (rpm - lastRpm) / dt; // Derivativo baseado na variação do RPM
   lastRpm = rpm;
   static float filteredD = 0; // Variável estática para manter o estado
-  filteredD = 0.85 * filteredD + 0.15 * D;  
+  filteredD = 0.7 * lastFilteredD + 0.3 * D; // Filtro mais agressivo
+  lastFilteredD = filteredD;
   lastError = error;
   
-  float output = PWM_MOTOR_INICIAL + P + integral + filteredD;
+  float output = 0;
+  if(SETPOINT_RPM(rpm) == 45.0)
+  {
+    output = PWM_MOTOR_INICIAL_45 + P + integral + filteredD;
+  }
+  else
+  {
+    output = PWM_MOTOR_INICIAL_33 + P + integral + filteredD;
+  }
+  
   output = constrain(output, 0, 255);
 
   Serial.print("P:");
@@ -141,9 +165,9 @@ float computePID(float rpm, float setpoint, bool resetPID) {
 
 float activateMotor(float pidOutput) 
 {
-  static float output = PWM_MOTOR_INICIAL;
-  const float smoothingFactor = 0.3; // Resposta mais rápida
-  
+  static float output = PWM_MOTOR_INICIAL_33;
+  float smoothingFactor = (pidOutput > 150) ? 0.5 : 0.3; // Resposta mais rápida em alta carga
+
   output += smoothingFactor * (pidOutput - output);
   output = constrain(output, 0, 255);
   
@@ -183,7 +207,7 @@ void setup() {
   
   digitalWrite(IN3_PIN, LOW);
   digitalWrite(IN4_PIN, HIGH);
-  ledcWrite(0, PWM_MOTOR_INICIAL);
+  ledcWrite(0, PWM_MOTOR_INICIAL_33);
 
   attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), countPulse, FALLING);
 }
@@ -194,14 +218,6 @@ void loop()
   static bool pidActive = false;
   
   float rpm = calculateRPM();
-  
-  // Lógica de ativação
-  if(rpm == 0) {
-    pidActive = false;
-    ledcWrite(0, PWM_MOTOR_INICIAL);
-  } else if(rpm > 25 && !pidActive) {
-    pidActive = true;
-  }
 
   if(rpm > (SETPOINT_RPM(rpm) + HYSTERESIS)) 
   {
@@ -214,6 +230,35 @@ void loop()
   else 
   {
     setpoint = SETPOINT_RPM(rpm);
+  }
+
+    // Lógica de ativação
+  if(rpm == 0) 
+  {
+    pidActive = false;
+    
+    if(setpoint == 45.0)
+    {
+      ledcWrite(0, PWM_MOTOR_INICIAL_45);
+    }
+    else
+    {
+      ledcWrite(0, PWM_MOTOR_INICIAL_33);
+    }
+  } 
+  else if(rpm > 25 && !pidActive && setpoint == 45.0) 
+  {
+    pidActive = true;
+  }
+
+  if (setpoint == 45.0) {
+    Kp = KP_45;
+    Ki = KI_45;
+    Kd = KD_45;
+  } else {
+    Kp = KP_33;
+    Ki = KI_33;
+    Kd = KD_33;
   }
   
   if(pidActive) 
